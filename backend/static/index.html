@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Twilio Voice Test</title>
+    <script src="https://sdk.twilio.com/js/client/v1.13/twilio.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 500px;
+            margin: 50px auto;
+            text-align: center;
+        }
+
+        input,
+        button {
+            padding: 10px;
+            font-size: 16px;
+            margin: 10px 5px;
+            width: 80%;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Twilio Voice over IP</h2>
+
+    <div>
+        <input id="identity" placeholder="Enter your identity" />
+        <button onclick="getToken()">Get Token</button>
+    </div>
+
+    <div>
+        <input id="to" placeholder="Call To (e.g., +1234567890 or client identity)" />
+        <button onclick="makeCall()">Call</button>
+        <button onclick="hangup()">Hang Up</button>
+    </div>
+
+    <div id="log" style="margin-top: 20px; color: green;"></div>
+
+    <script>
+        let device;
+        let currentConnection;
+
+        function log(msg) {
+            document.getElementById('log').innerText = msg;
+            console.log(msg);
+        }
+
+        async function getToken() {
+            const identity = document.getElementById('identity').value;
+            if (!identity) return log("Please enter an identity first.");
+
+            try {
+                const response = await fetch(`/token?identity=${encodeURIComponent(identity)}`);
+                const data = await response.json();
+                if (!data.token) throw new Error("No token received");
+
+                log("Token received. Initializing device...");
+
+                device = new Twilio.Device(data.token, {
+                    codecPreferences: ["opus", "pcmu"],
+                    fakeLocalDTMF: true,
+                    enableRingingState: true
+                });
+
+                device.on("ready", () => log("Device ready!"));
+                device.on("error", (error) => log("Device error: " + error.message));
+                device.on("connect", (conn) => {
+                    log("Call connected");
+                    currentConnection = conn;
+                });
+                device.on("disconnect", () => {
+                    log("Call disconnected");
+                    currentConnection = null;
+                });
+
+                // ✅ Accept incoming calls
+                device.on("incoming", (conn) => {
+                    log("Incoming call from: " + conn.parameters.From);
+                    if (confirm(`Accept call from ${conn.parameters.From}?`)) {
+                        conn.accept();
+                    } else {
+                        conn.reject();
+                    }
+                });
+
+            } catch (err) {
+                log("Failed to get token: " + err.message);
+            }
+        }
+
+        function makeCall() {
+            const to = document.getElementById("to").value;
+            if (!to || !device) return log("Please enter 'To' and initialize the device.");
+
+            const connection = device.connect({ To: to }); // autoamtically Hits your FastAPI backend at /voice with a POST request
+            currentConnection = connection;
+            log("Calling " + to + "...");
+        }
+
+        function hangup() {
+            if (currentConnection) {
+                currentConnection.disconnect();
+            } else if (device) {
+                device.disconnectAll();
+            }
+            log("Call ended.");
+        }
+    </script>
+
+</body>
+
+</html>
