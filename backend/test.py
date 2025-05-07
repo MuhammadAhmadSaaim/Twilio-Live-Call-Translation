@@ -1,29 +1,29 @@
+# server.py
 import asyncio
 import os
 import logging
-import json
-import base64
-import io
-import traceback
-import audioop
-import numpy as np
-import soundfile as sf
-from fastapi import FastAPI, WebSocket, Request, Form, HTTPException, Query
-from fastapi.responses import Response, FileResponse
+from fastapi import FastAPI, HTTPException, Request, Query, Form, WebSocket
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse, Dial
 from dotenv import load_dotenv
 from twilio.rest import Client
+import uvicorn
+import traceback
+import json
+import base64
+from vosk import Model, KaldiRecognizer
 from pydub import AudioSegment
-import openai
-import os
-import threading
-from websockets.legacy.client import connect
+import io
 
+#################################################################################################################
 
+model_path = os.path.join(os.getcwd(), "vosk_model", "vosk-model-small-en-us-0.15")  # Change path if needed
+asr_model = Model(model_path)
 #################################################################################################################
 
 # --- Configuration ---
@@ -41,8 +41,6 @@ TWILIO_API_KEY_SID = os.getenv("TWILIO_API_KEY_SID")
 TWILIO_API_KEY_SECRET = os.getenv("TWILIO_API_KEY_SECRET")
 TWIML_APP_SID = os.getenv("TWIML_APP_SID")
 TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID", None) # Optional
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Simple validation
 if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, TWIML_APP_SID]):
@@ -106,87 +104,79 @@ async def get_token(identity: str = Query(..., min_length=1, description="The id
 
 ##################################################################################################################
 
-# Start this inside /media
-from websockets.legacy.client import connect  # ✅ Legacy-compatible import
+import os
+import json
+import base64
+from fastapi import WebSocket, WebSocketDisconnect
+from vosk import Model, KaldiRecognizer
+import numpy as np
+import wave
+import collections
 
-async def start_openai_realtime_session(twilio_ws: WebSocket, target_language: str = "ur"):
-    uri = "wss://api.openai.com/v1/realtime"
-    headers = [
-        ("Authorization", f"Bearer {os.getenv('OPENAI_API_KEY')}"),
-        ("OpenAI-Beta", "realtime")
-    ]
+model_path = os.path.join(os.getcwd(), "vosk_model", "vosk-model-small-en-us-0.15")
+asr_model = Model(model_path)
 
-    async with connect(uri, extra_headers=headers) as openai_ws:
-        # Step 1: Create session with OpenAI
-        session_create = {
-            "type": "session.create",
-            "model": "gpt-4o-realtime-preview",
-            "input_audio_transcription": {
-                "model": "whisper-1",
-                "language": "en"
-            },
-            "output_audio": {
-                "voice": "nova",
-            },
-            "translation": {
-                "target_language": target_language
-            },
-            "instruction": "Translate this like a real person would. Just give the translated sentence—no explanation."
-        }
-
-        await openai_ws.send(json.dumps(session_create))
-
-        # Forward audio from Twilio to OpenAI
-        async def forward_twilio_audio():
-            async for message in twilio_ws.iter_text():
-                msg = json.loads(message)
-                if msg.get("event") == "media":
-                    audio_data = base64.b64decode(msg["media"]["payload"])
-                    pcm_data = audioop.ulaw2lin(audio_data, 2)
-                    audio_b64 = base64.b64encode(pcm_data).decode("utf-8")
-
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": audio_b64
-                    }))
-
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.commit"
-                    }))
-
-                elif msg.get("event") == "stop":
-                    print("Twilio call stopped")
-                    await openai_ws.close()
-                    break
-
-        # Receive audio from OpenAI and send back to Twilio
-        async def receive_openai_audio():
-            while True:
-                try:
-                    response = await openai_ws.recv()
-                    data = json.loads(response)
-
-                    if data["type"] == "audio":
-                        ulaw_audio = base64.b64decode(data["audio"])
-                        for i in range(0, len(ulaw_audio), 160):
-                            await twilio_ws.send_bytes(ulaw_audio[i:i+160])
-                            await asyncio.sleep(0.02)
-                except Exception as e:
-                    print("OpenAI stream error:", e)
-                    break
-
-        await asyncio.gather(forward_twilio_audio(), receive_openai_audio())
-
+SAMPLE_RATE = 8000
+CHUNK_DURATION_MS = 20  # each Twilio chunk is 20ms
+BUFFER_TARGET_MS = 300  # how much to buffer before processing
+CHUNKS_PER_BATCH = BUFFER_TARGET_MS // CHUNK_DURATION_MS
 
 @app.websocket("/media")
 async def media_stream(websocket: WebSocket):
     await websocket.accept()
+    print("connection open")
+
+    recognizer = KaldiRecognizer(asr_model, SAMPLE_RATE)
+    audio_buffer = bytearray()
+    chunk_count = 0
+    chunk_queue = collections.deque()
+
     try:
-        await start_openai_realtime_session(websocket)
+        while True:
+            message = await websocket.receive_text()
+            msg = json.loads(message)
+
+            if msg.get("event") == "media":
+                chunk_count += 1
+                audio_data = base64.b64decode(msg["media"]["payload"])
+
+                if len(audio_data.strip(b"\x00")) == 0:
+                    print(f"[{chunk_count}] Silence detected. Triggering ASR with buffered audio.")
+                    if audio_buffer:
+                        result = recognizer.AcceptWaveform(audio_buffer)
+                        if result:
+                            text = json.loads(recognizer.Result()).get("text", "")
+                            if text:
+                                print(f"🔊 [Silence-Triggered Transcript]: {text}")
+                        audio_buffer.clear()
+
+                else:
+                    audio_buffer.extend(audio_data)
+                    chunk_queue.append(audio_data)
+
+                    if len(chunk_queue) >= CHUNKS_PER_BATCH:
+                        print(f"[{chunk_count}] Processing {len(chunk_queue)} chunks (~{BUFFER_TARGET_MS}ms audio)")
+                        result = recognizer.AcceptWaveform(audio_buffer)
+                        if result:
+                            text = json.loads(recognizer.Result()).get("text", "")
+                            if text:
+                                print(f"🧠 [Buffered Transcript]: {text}")
+                        audio_buffer.clear()
+                        chunk_queue.clear()
+
+
+            elif msg.get("event") == "stop":
+                print("Call ended by Twilio.")
+                break
+
+    except WebSocketDisconnect:
+        print("WebSocket disconnected.")
     except Exception as e:
-        logger.error("Realtime session error", exc_info=True)
+        print(f"Error: {e}")
     finally:
+        print("connection closed")
         await websocket.close()
+
 
 
 ##################################################################################################################
@@ -243,8 +233,6 @@ async def voice(request: Request,
         else:
             print(f">>> Dialing CLIENT: {To}")
             dial.client(To)
-        
-        logger.info(Dial)  # Log the Dial object for debugging
 
         response.append(dial)
 
