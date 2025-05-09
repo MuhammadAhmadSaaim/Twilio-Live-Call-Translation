@@ -207,6 +207,18 @@ async def voice(request: Request):
         return Response(content=str(response), media_type="application/xml")
 
 
+# !!# --- WebSocket for audio streaming --- !!
+"""
+In this modified version, each WebSocket endpoint (`/ws/caller` and `/ws/receiver`) maintains its own separate connection to OpenAI’s real-time API,
+rather than centralizing the OpenAI connection per call session. To achieve bi-directional communication—where the caller’s speech is processed by 
+OpenAI and sent to the receiver, and vice versa—the logic is adjusted so that the AI-generated audio responses are not returned to the same WebSocket 
+that provided the input audio. Instead, each endpoint forwards OpenAI’s output to the opposite party's WebSocket. This is done using a shared dictionary 
+(`active_call_streams`) keyed by the `callSid`, which stores references to both the caller’s and receiver’s WebSocket connections 
+(`caller_ws` and `receiver_ws`) and their respective stream IDs. When OpenAI returns audio data, the endpoint retrieves the opposing party’s WebSocket 
+and stream ID from the shared dictionary and sends the audio there. This design maintains independent OpenAI sessions for each direction of audio while
+enabling true cross-stream interaction between the two parties, effectively enabling real-time AI-mediated dialogue without requiring a unified session object.
+"""
+
 # --- WebSocket for audio streaming ---
 @app.websocket("/ws/caller")
 async def websocket_stream_endpoint(websocket: WebSocket):
